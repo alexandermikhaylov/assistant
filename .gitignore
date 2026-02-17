@@ -1,0 +1,24 @@
+.env
+*.log
+__pycache__/
+.DS_Store
+
+# Ignore global data (logs, temp states)
+data/
+
+# --- USER ISOLATION ---
+# Ignore all user content. Users manage their own repos.
+users/*
+!users/.gitkeep
+
+# Ignore user registry (contains secrets like GitHub PATs)
+config/user_registry.json
+
+# Ignore global config leftovers (if any)
+config/gemini/google_accounts.json
+config/gemini/oauth_creds.json
+config/gemini/state.json
+config/gemini/installation_id
+
+# Build artifacts
+build.log

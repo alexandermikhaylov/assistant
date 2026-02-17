@@ -1,0 +1,21 @@
+services:
+  ai-assistant:
+    build: .
+    volumes:
+      - ./data:/app/data
+      - ./scripts:/app/scripts
+      - ./core_instructions:/app/core_instructions
+      - ./config:/app/config
+      # Removed ../users:/app/users mount as per requirement
+      - ./data/logs:/app/data/logs
+      - users_data:/app/users
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ADMIN_ID=${TELEGRAM_ADMIN_ID}
+    tty: true
+    stdin_open: true
+    restart: always
+
+volumes:
+  users_data:
+
