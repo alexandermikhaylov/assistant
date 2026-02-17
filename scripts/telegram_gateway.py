@@ -16,6 +16,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import BufferedInputFile, InputMediaPhoto
 
 import state_inspector as state_inspector
+import git_manager as git_manager
 from utils import strip_ansi
 
 import json
@@ -25,6 +26,7 @@ ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID")
 USERS_ROOT = "/app/users"
 BRIDGE_LOG = "/app/data/logs/whatsapp_bridge.log"
 ALLOWED_USERS_FILE = "/app/config/allowed_users.json"
+USER_REGISTRY_FILE = "/app/config/user_registry.json"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -32,6 +34,9 @@ start_time = time.time()
 
 # Global storage for active auth processes: user_id -> subprocess.Process
 pending_auth_sessions = {}
+
+# Onboarding state: user_id -> { 'state': 'URL'|'TOKEN', 'data': {} }
+pending_onboarding = {}
 
 def log_tg(msg):
     print(f"--- [TG GATEWAY] {datetime.now().strftime('%H:%M:%S')} - {msg}", flush=True)
@@ -54,11 +59,162 @@ def is_user_allowed(user_id):
         return False
 
 async def check_access(message: types.Message):
-    if not is_user_allowed(message.from_user.id):
+    user_id = str(message.from_user.id)
+    
+    # 1. Check Whitelist
+    if not is_user_allowed(user_id):
         log_tg(f"⛔ Access denied for user {message.from_user.id} ({message.from_user.full_name})")
         await message.answer("⛔ <b>Доступ запрещен.</b>\nВаш ID не найден в белом списке бота.")
         return False
+        
+    # 2. Check Onboarding Status
+    if user_id in pending_onboarding:
+        # ALLOW auth commands to bypass onboarding trap
+        if message.text and (message.text.startswith('/auth') or message.text.startswith('/gemini_code')):
+             return True
+             
+        await handle_onboarding_message(message)
+        return False
+        
+    # 3. Check Registration
+    paths = get_user_paths(user_id)
+    if not os.path.exists(paths["tasks"]):
+        # Allowed but no folder -> Start Onboarding
+        log_tg(f"User {user_id} allowed but not initialized. Starting onboarding.")
+        pending_onboarding[user_id] = {'state': 'URL'}
+        await message.answer(
+            "👋 <b>Добро пожаловать!</b>\n\n"
+            "Вы авторизованы, но мне нужно настроить ваше личное хранилище.\n"
+            "Я использую <b>private GitHub repository</b> для хранения всех ваших задач, памяти и настроек.\n\n"
+            "Пожалуйста, пришлите мне <b>HTTPS URL</b> вашего приватного репозитория:\n"
+            "Пример: <code>https://github.com/username/my-assistant-data.git</code>",
+            parse_mode="HTML"
+        )
+        return False
+        
     return True
+
+async def handle_onboarding_message(message: types.Message):
+    user_id = str(message.from_user.id)
+    state_data = pending_onboarding[user_id]
+    state = state_data.get('state')
+    text = message.text.strip()
+    
+    if state == 'URL':
+        # Basic validation
+        if not text.startswith("https://") or not text.endswith(".git"):
+            await message.answer("⚠️ Некорректный URL. Он должен начинаться с <code>https://</code> и заканчиваться на <code>.git</code>.", parse_mode="HTML")
+            return
+            
+        pending_onboarding[user_id]['repo_url'] = text
+        pending_onboarding[user_id]['state'] = 'TOKEN'
+        await message.answer(
+            "✅ URL сохранен.\n\n"
+            "Теперь мне нужен <b>GitHub Personal Access Token (Classic)</b> для доступа к этому репозиторию.\n\n"
+            "1. Перейдите в GitHub -> Settings -> Developer Settings -> Personal access tokens (Tokens (classic)).\n"
+            "2. Создайте новый токен с правами <b>repo</b> (full control).\n"
+            "3. Пришлите мне токен (начинается с <code>ghp_</code> или <code>github_pat_</code>).",
+            parse_mode="HTML"
+        )
+        
+    elif state == 'TOKEN':
+        if not text.startswith("ghp_") and not text.startswith("github_pat_"):
+             await message.answer("⚠️ Это не похоже на GitHub Token. Токен обычно начинается с <code>ghp_</code> или <code>github_pat_</code>.")
+             return
+             
+        repo_url = pending_onboarding[user_id]['repo_url']
+        
+        await message.answer("🔄 Настраиваю подключение и клонирую репозиторий...")
+        
+        # Save to registry
+        try:
+            registry = {}
+            if os.path.exists(USER_REGISTRY_FILE):
+                with open(USER_REGISTRY_FILE, 'r') as f:
+                    registry = json.load(f)
+            
+            registry[user_id] = {
+                "repo_url": repo_url,
+                "github_pat": text,
+                "branch": "main",
+                "git_username": message.from_user.full_name or "Assistant User",
+                "git_email": f"{user_id}@assistant.bot"
+            }
+            
+            with open(USER_REGISTRY_FILE, 'w') as f:
+                json.dump(registry, f, indent=4)
+                
+            # Trigger setup via Git Manager
+            # Run in executor to avoid blocking loop
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, git_manager.setup_user_repo, user_id, registry[user_id])
+            
+            # Initialize structure if needed
+            try:
+                success, msg = await loop.run_in_executor(None, git_manager.initialize_repo_structure, user_id)
+            except ValueError:
+                # Handle legacy return if not updated hot
+                success = False; msg = "Internal error: git_manager updated during execution."
+            
+            if success:
+                pending_onboarding[user_id]['state'] = 'AUTH_REQUIRED'
+                await message.answer(
+                    "✅ <b>Репозиторий подключен!</b>\n\n"
+                    "Теперь нужно авторизовать <b>Google Gemini</b>, чтобы я мог работать.\n"
+                    "Я сейчас запущу процесс авторизации. Пожалуйста, перейдите по ссылке, которую я пришлю, и отправьте мне код."
+                )
+                # Automatically trigger auth
+                await authenticate(message, "gemini")
+            else:
+                 log_tg(f"Onboarding failed: {msg}")
+                 await message.answer(f"❌ <b>Ошибка при инициализации репозитория:</b>\n{msg}\n\nПожалуйста, проверьте права токена (нужен <code>repo</code> access) и попробуйте снова (отправьте URL заново).")
+                 # Reset state to allow retry
+                 pending_onboarding[user_id]['state'] = 'URL'
+                 
+        except Exception as e:
+             log_tg(f"Onboarding error: {e}"); traceback.print_exc()
+             await message.answer(f"❌ Произошла ошибка: {e}")
+
+    elif state == 'AUTH_REQUIRED':
+        await message.answer(
+            "⏳ <b>Ожидаю авторизацию...</b>\n\n"
+            "Пожалуйста, перейдите по ссылке выше и пришлите код командой:\n"
+            "<code>/auth_code ВАШ_КОД</code>\n\n"
+            "Если ссылка истекла, нажмите /auth.",
+            parse_mode="HTML"
+        )
+        
+    elif state == 'SURVEY':
+        # Create a task for task_runner to process the profile
+        paths = get_user_paths(user_id)
+        task_filename = f"onboarding_profile_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+        
+        task_content = (
+            f"# User Onboarding Profile & Analysis\n\n"
+            f"The user has just finished onboarding. They provided the following description of their interests:\n"
+            f"> {text}\n\n"
+            f"**Your Goal:**\n"
+            f"1. Create a file `memories/initial_profile.md` containing extracted facts about the user's interests.\n"
+            f"2. Analyze their needs and suggest 2-3 specific MCP tools that might be useful (e.g. Football API, Spotify, advanced coding tools, etc.).\n"
+            f"3. Create a file `instructions/suggested_tools.md` with these recommendations and how to install them (briefly).\n"
+            f"4. Reply to the user with a friendly welcome message, confirming you understood their interests, and listing your recommendations.\n"
+        )
+        
+        metadata = {"message_id": message.message_id, "chat_id": message.chat.id, "user_id": user_id}
+        
+        try:
+            with open(os.path.join(paths["tasks"], task_filename), "w") as f:
+                f.write(f"--- \n{yaml.dump(metadata, allow_unicode=True)}--- \n\n{task_content}\n")
+            
+            del pending_onboarding[user_id]
+            await message.answer("👍 Спасибо! Я анализирую ваш ответ и сейчас вернусь с рекомендациями...")
+            # React to indicate processing
+            try: await message.react(reaction=[types.ReactionTypeEmoji(emoji="thinking_face")])
+            except: pass
+            
+        except Exception as e:
+            log_tg(f"Error saving onboarding task: {e}")
+            await message.answer("❌ Ошибка при сохранении ответа.")
 
 def get_user_paths(user_id):
     """Returns dict with paths for specific user."""
@@ -213,17 +369,27 @@ async def monitor_qr_code():
             log_tg(f"QR Monitor error: {e}"); traceback.print_exc()
         await asyncio.sleep(3)
 
-@dp.message(Command("auth"))
-async def cmd_auth(message: types.Message, command: Command):
-    if not await check_access(message): return
+# Alias map: user-friendly names → actual MCP server/tool names
+TOOL_ALIASES = {
+    # Russian aliases
+    "календарь": "google_calendar",
+    "калeндарь": "google_calendar",
+    "гугл календарь": "google_calendar",
+    # English aliases
+    "calendar": "google_calendar",
+    "google calendar": "google_calendar",
+    "gcal": "google_calendar",
+    "whatsapp": "whatsapp",
+    "wa": "whatsapp",
+    "вотсап": "whatsapp",
+    "ватсап": "whatsapp",
+}
+
+async def authenticate(message: types.Message, tool: str):
     user_id = str(message.from_user.id)
-    tool = command.args.split()[0].lower() if command.args else "gemini"
     
-    # 1. Special case: WhatsApp (Restart Bridge)
-    if tool == "whatsapp":
-        if str(message.from_user.id) != str(ADMIN_ID):
-            await message.answer("⛔ Only the administrator can restart the WhatsApp bridge.")
-            return
+    # 1. WhatsApp Bridge Restart (Special Case)
+    if tool.lower() == "whatsapp":
         await message.answer("🔄 Restarting WhatsApp bridge to trigger a new QR code...")
         try:
             ps_output = subprocess.check_output(["ps", "aux"]).decode()
@@ -254,17 +420,21 @@ async def cmd_auth(message: types.Message, command: Command):
     # Map friendly names to trigger prompts
     # If it's just 'gemini', we run it without args. 
     # Otherwise, we ask Gemini to use the tool and list something to force tool-level authentication.
-    cmd = ["gemini"]
+    cmd = ["gemini", "-y"]
+    auth_prompt = None
     if tool != "gemini":
-        cmd.extend(["-y", "-p", f"Use {tool} and call its tools to list some information. This is to verify authentication and trigger an OAuth flow if needed."])
+        auth_prompt = f"Use {tool} and call its tools to list some information. This is to verify authentication and trigger an OAuth flow if needed."
     
-    await message.answer(f"🔄 Starting authentication for: <b>{tool}</b>...", parse_mode="HTML")
+    if tool == "gemini":
+        await message.answer(f"🔄 Starting authentication for: <b>Gemini CLI</b>...", parse_mode="HTML")
+    else:
+        await message.answer(f"🔄 Starting authentication for: <b>{tool}</b>...", parse_mode="HTML")
+
     log_tg(f"User {user_id} requested auth for tool: {tool}")
 
     try:
         env = os.environ.copy()
         env['HOME'] = user_home_dir
-        env['NO_BROWSER'] = '1'
         env['TERM'] = 'dumb'
         os.makedirs(os.path.join(user_home_dir, '.gemini'), exist_ok=True)
 
@@ -277,38 +447,89 @@ async def cmd_auth(message: types.Message, command: Command):
             cwd="/app"
         )
         
-        auth_url = None
-        output_acc_raw = b""
-        start_search = time.time()
+        # Feed prompt via stdin (same approach as run_gemini in task_runner.py)
+        if auth_prompt:
+            process.stdin.write(auth_prompt.encode())
+            await process.stdin.drain()
         
-        while time.time() - start_search < 15:
+        # DO NOT close stdin here! We need it open to send the code later if requested (for gemini -y or tools).
+        # process.stdin.close() 
+        # await process.stdin.wait_closed()
+        
+        auth_url = None
+        exit_reason = "unknown"
+        start_search = time.time()
+        output_acc_raw = b""
+        log_buffer = ""
+
+        while True:
             try:
-                chunk = await asyncio.wait_for(process.stdout.read(8192), timeout=1)
-                if not chunk: break
+                chunk = await asyncio.wait_for(process.stdout.read(8192), timeout=2)
+                if not chunk:
+                    exit_reason = "process_stdout_closed"
+                    break
                 
                 output_acc_raw += chunk
+                
+                # Check for URLs in stdout chunk
+                chunk_str = chunk.decode(errors='ignore')
+                log_tg(f"Auth: chunk +{len(chunk)}b: {chunk_str[:50]}...")
+                
                 output_acc = strip_ansi(output_acc_raw.decode(errors='ignore'))
                 
+                # Regex for OAuth URL (Gemini standard)
                 urls = re.findall(r'https://[^\s\x00-\x1f\x7f-\xff\x1b]+', output_acc)
-                for url in urls:
-                    if 'google' in url.lower() and 'oauth' in url.lower():
-                        auth_url = url.strip().rstrip('.:,;)]')
-                        break
+                if urls:
+                    log_tg(f"Auth: found URLs in stdout: {urls}")
+                    for url in urls:
+                        if "accounts.google.com" in url and any(x in url for x in [
+                            'redirect_uri',
+                            'response_type',
+                            'client_id',
+                            'scope',
+                            'consent',
+                            'authorization',
+                        ]):
+                            auth_url = url.strip().rstrip('.:,;)]\'"')
+                            break
                 
-                if auth_url or "Enter the authorization code" in output_acc or "Welcome" in output_acc or "Final Answer" in output_acc:
+                if auth_url:
+                    exit_reason = "oauth_url_found"
                     break
+                if "Enter the authorization code" in output_acc:
+                    exit_reason = "auth_code_prompt"
+                    break
+                if "Final Answer" in output_acc:
+                    exit_reason = "final_answer"
+                    break
+                    
             except asyncio.TimeoutError:
-                if auth_url: break
-                if time.time() - start_search > 12: break
+                elapsed = time.time() - start_search
+                # Log periodic status during wait
+                if int(elapsed) % 10 == 0:
+                    log_tg(f"Auth: waiting... {elapsed:.0f}s elapsed, {len(output_acc_raw)} bytes so far")
+                if elapsed > 55:
+                    exit_reason = "timeout"
+                    break
                 continue
+        
+        log_tg(f"Auth: DONE. exit_reason={exit_reason}, total_bytes={len(output_acc_raw)}, output:\n{output_acc[:1000]}")
         
         if auth_url:
             pending_auth_sessions[user_id] = process
-            await message.answer(f"🔑 <b>Authorize {tool.capitalize()}</b>\n\nPlease open this URL:\n{auth_url}\n\nThen reply with:\n<code>/gemini_code YOUR_CODE</code>", parse_mode="HTML")
+            await message.answer(f"🔑 <b>Authorize {tool.capitalize()}</b>\n\nPlease open this URL:\n{auth_url}\n\nThen reply with:\n<code>/auth_code YOUR_CODE</code>", parse_mode="HTML")
         else:
-            output_acc = strip_ansi(output_acc_raw.decode(errors='ignore'))
-            if "Welcome" in output_acc or not output_acc or "Final Answer" in output_acc:
+            if exit_reason == "final_answer" or not output_acc:
                  await message.answer(f"✅ <b>{tool.capitalize()}</b> is already authenticated.")
+                 # If user was in AUTH_REQUIRED Onboarding state, proceed to Survey immediately
+                 if user_id in pending_onboarding and pending_onboarding[user_id].get('state') == 'AUTH_REQUIRED':
+                    pending_onboarding[user_id]['state'] = 'SURVEY'
+                    await message.answer(
+                        "✅ <b>Отлично! Теперь мы готовы к работе.</b>\n\n"
+                        "Чтобы я мог лучше помогать вам, расскажите немного о себе.\n"
+                        "<b>Какие у вас основные цели и интересы?</b> (например: программирование, спорт, изучение языков...)\n\n"
+                        "Напишите ответ, и я подготовлю рекомендации."
+                    )
             else:
                 await message.answer(f"⚠️ No OAuth URL found for <b>{tool}</b>. Check if it's already working.\n\n<pre>{output_acc[:500]}</pre>", parse_mode="HTML")
             process.kill()
@@ -317,14 +538,20 @@ async def cmd_auth(message: types.Message, command: Command):
         log_tg(f"Auth error: {e}"); traceback.print_exc()
         await message.answer(f"❌ Error: {e}")
 
-@dp.message(Command("gemini_code"))
-async def cmd_gemini_code(message: types.Message, command: Command):
+@dp.message(Command("auth"))
+async def cmd_auth(message: types.Message, command: Command):
+    if not await check_access(message): return
+    tool = command.args or "gemini"
+    await authenticate(message, tool)
+
+@dp.message(Command("auth_code", "gemini_code"))
+async def cmd_auth_code(message: types.Message, command: Command):
     if not await check_access(message): return
     user_id = str(message.from_user.id)
     code = command.args
     
     if not code:
-        await message.answer("Please provide the authorization code: `/gemini_code YOUR_CODE`")
+        await message.answer("Please provide the authorization code: `/auth_code YOUR_CODE`")
         return
 
     process = pending_auth_sessions.get(user_id)
@@ -349,8 +576,30 @@ async def cmd_gemini_code(message: types.Message, command: Command):
         
         log_tg(f"Auth finalization output: {output}")
         
-        if process.returncode == 0 or "Welcome" in output or "Authenticated" in output or "Final Answer" in output:
+        # Check for success indicators. 
+        # Note: Gemini CLI might exit with 42 (No Input) if we passed -y but no prompt, 
+        # but if it says "Loaded cached credentials", auth worked.
+        is_success = (
+            process.returncode == 0 or 
+            "Welcome" in output or 
+            "Authenticated" in output or 
+            "Final Answer" in output or
+            "Loaded cached credentials" in output
+        )
+
+        if is_success:
             await message.answer("✅ Authentication successful!")
+            
+            # ONBOARDING TRIGGER:
+            if user_id in pending_onboarding and pending_onboarding[user_id].get('state') == 'AUTH_REQUIRED':
+                pending_onboarding[user_id]['state'] = 'SURVEY'
+                await message.answer(
+                    "🎉 <b>Авторизация пройдена!</b>\n\n"
+                    "Последний шаг: чтобы я мог лучше помогать вам, расскажите немного о себе.\n"
+                    "<b>Какие у вас основные цели и интересы?</b> (например: программирование, спорт, изучение языков, управление проектами...)\n\n"
+                    "Напишите ответ, и я подготовлю для вас рекомендации."
+                )
+
         else:
             await message.answer(f"⚠️ Output (Exit code {process.returncode}):\n```\n{output[:1000]}\n```")
             
@@ -415,8 +664,8 @@ async def handle_confirmation(callback: types.CallbackQuery):
 @dp.message()
 async def handle_message(message: types.Message):
     if not await check_access(message): return
-    user_id = message.from_user.id
-    paths = ensure_user_structure(user_id)
+    user_id = str(message.from_user.id)
+    paths = ensure_user_structure(message.from_user.id)
     
     target_msg_id = message.reply_to_message.message_id if message.reply_to_message else None
     task_path = find_task_by_msg_id(user_id, target_msg_id)

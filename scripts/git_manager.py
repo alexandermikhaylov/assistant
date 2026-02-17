@@ -10,10 +10,14 @@ USER_REGISTRY_FILE = "/app/config/user_registry.json"
 USERS_ROOT = "/app/users"
 
 # Setup Logger
+# Setup Logger
 logging.basicConfig(
-    filename=LOG_FILE,
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger("GitManager")
 
@@ -103,10 +107,130 @@ def commit_and_push(user_id, commit_message):
     run_git_cmd(user_dir, ["commit", "-m", commit_message], "Commit changes")
     
     # Push (only if remote is configured)
-    if config.get("repo_url"):
-        run_git_cmd(user_dir, ["push"], "Push changes")
+    repo_url = config.get("repo_url")
+    if repo_url:
+        branch = config.get("branch", "main")
+        
+        # Ensure remote URL has PAT (redundant safety check)
+        github_pat = config.get("github_pat")
+        if repo_url.startswith("https://") and github_pat and github_pat != "YOUR_GITHUB_PAT_HERE":
+             authenticated_repo_url = repo_url.replace("https://", f"https://oauth2:{github_pat}@")
+             run_git_cmd(user_dir, ["remote", "set-url", "origin", authenticated_repo_url], "Ensure remote URL has PAT")
+        
+        # Explicit push
+        success, output = run_git_cmd(user_dir, ["push", "origin", branch], f"Push to {branch}")
+        if success:
+            logger.info(f"Push output: {output}")
+            return True, "Success"
+        else:
+             logger.error(f"Push failed: {output}")
+             return False, f"Push failed: {output}"
     else:
         logger.info(f"No remote URL for user {user_id}. Changes committed locally.")
+        return True, "Committed locally"
+
+def initialize_repo_structure(user_id):
+    """
+    Checks if the user's repo has the required structure.
+    If not, creates default directories and pushes to remote.
+    Returns: (success, message)
+    """
+    user_dir = os.path.join(USERS_ROOT, f"user_{user_id}")
+    if not os.path.exists(user_dir):
+        logger.error(f"User directory {user_dir} does not exist. Cannot initialize.")
+        return False, "User directory not found"
+
+    # Check for critical directories
+    tasks_dir = os.path.join(user_dir, "tasks")
+    if os.path.exists(tasks_dir):
+        logger.info(f"Repo for user {user_id} seems already initialized.")
+        return True, "Already initialized"
+
+    logger.info(f"Initializing new repo structure for user {user_id}...")
+    
+    # Create structure
+    os.makedirs(os.path.join(user_dir, "tasks", "archive"), exist_ok=True)
+    os.makedirs(os.path.join(user_dir, "tasks", "recurrent"), exist_ok=True)
+    os.makedirs(os.path.join(user_dir, "memories"), exist_ok=True)
+    os.makedirs(os.path.join(user_dir, "instructions"), exist_ok=True)
+    os.makedirs(os.path.join(user_dir, "mcp-servers"), exist_ok=True)
+    os.makedirs(os.path.join(user_dir, "skills"), exist_ok=True)
+    
+    # Create some .gitkeep files to ensure directories are tracked
+    for folder in ["tasks", "memories", "instructions", "mcp-servers", "skills"]:
+        with open(os.path.join(user_dir, folder, ".gitkeep"), "w") as f:
+            f.write("")
+            
+    # Create default skills.md if it doesn't exist
+    skills_md_path = os.path.join(user_dir, "skills", "skills.md")
+    if not os.path.exists(skills_md_path):
+        with open(skills_md_path, "w") as f:
+            f.write(
+                "# Skills\n\n"
+                "This directory contains skills that extend the assistant's capabilities.\n"
+                "Each skill should be in its own subdirectory with a `SKILL.md` file describing it.\n"
+            )
+            
+    # Create default Gemini config
+    gemini_dir = os.path.join(user_dir, ".gemini")
+    os.makedirs(gemini_dir, exist_ok=True)
+    
+    settings_path = os.path.join(gemini_dir, "settings.json")
+    if not os.path.exists(settings_path):
+        try:
+            with open(settings_path, "w") as f:
+                json.dump({
+                    "security": {
+                        "auth": {
+                            "selectedType": "oauth-personal"
+                        }
+                    },
+                    "mcpServers": {} 
+                }, f, indent=2)
+            logger.info(f"Created default .gemini/settings.json for user {user_id}")
+        except Exception as e:
+            logger.error(f"Failed to create settings.json for user {user_id}: {e}")
+    else:
+        # Validate existing config (Self-Healing)
+        try:
+            with open(settings_path, "r") as f:
+                current_settings = json.load(f)
+            
+            changed = False
+            # Fix mcpServers type
+            if "mcpServers" in current_settings and isinstance(current_settings["mcpServers"], list):
+                logger.warning(f"Found malformed mcpServers (list) for user {user_id}. Fixing to dict.")
+                # If it's a list, we can't easily convert to dict without keys, so reset to empty dict 
+                # or try to preserve if it was a list of objects with names? 
+                # For now, safer to reset or just make it empty if empty list
+                current_settings["mcpServers"] = {}
+                changed = True
+            
+            if changed:
+                with open(settings_path, "w") as f:
+                    json.dump(current_settings, f, indent=2)
+                logger.info(f"Self-healed settings.json for user {user_id}")
+                
+        except Exception as e:
+             logger.error(f"Failed to validate settings.json for user {user_id}: {e}")
+
+    # Create .gitignore
+    gitignore_path = os.path.join(user_dir, ".gitignore")
+    if not os.path.exists(gitignore_path):
+        with open(gitignore_path, "w") as f:
+            f.write(
+                "secrets/\n"
+                ".env\n"
+                "**/token.json\n"
+                "**/credentials.json\n"
+                ".gemini/*\n"
+                "!.gemini/settings.json\n"
+                "__pycache__/\n"
+                "*.log\n"
+            )
+            
+    # Commit and push
+    return commit_and_push(user_id, "Initialize Assistant folder structure")
 
 if __name__ == "__main__":
     import sys
@@ -123,7 +247,8 @@ if __name__ == "__main__":
             sys.exit(1)
         uid = sys.argv[2]
         msg = sys.argv[3] if len(sys.argv) > 3 else f"Update {datetime.now().isoformat()}"
-        commit_and_push(uid, msg)
+        success, out = commit_and_push(uid, msg)
+        print(f"Commit result: {success} - {out}")
         
     else:
         print("Usage: python git_manager.py [restore|commit]")

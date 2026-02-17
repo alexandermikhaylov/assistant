@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import yaml
 import json
@@ -45,6 +46,13 @@ def get_context(user_dir):
             if f.endswith(".md"):
                 with open(os.path.join(mem_dir, f), 'r') as file:
                     ctx += f"\nFILE {f} (from user_memories):\n{file.read()}\n"
+
+    # 4. User Skills (Available Capabilities)
+    skills_file = os.path.join(user_dir, "skills", "skills.md")
+    if os.path.exists(skills_file):
+        with open(skills_file, 'r') as file:
+            ctx += f"\nFILE skills.md (AVAILABLE_SKILLS):\n{file.read()}\n"
+
     return ctx
 
 def run_gemini(prompt, user_dir, yolo=True, timeout=300):
@@ -160,15 +168,15 @@ def process_tasks():
                     print(f"[{now}] OAuth required for user {user_id}. Distinguishing...")
                     # 681255809395 is the Gemini CLI Client ID
                     if "681255809395" in response:
-                        response = "<thought>Gemini CLI needs authentication.</thought><answer>⚠️ Пожалуйста, используйте команду /gemini_auth для авторизации, и тогда всё заработает.</answer>"
+                        response = "<thought>Gemini CLI needs authentication.</thought><answer>⚠️ Пожалуйста, используйте команду /auth для авторизации, и тогда всё заработает.</answer>"
                     else:
                         # Extract the URL
                         match = re.search(r'(https://[^\s]*google\.com/[^\s]*oauth[^\s]*)', response, re.IGNORECASE)
                         if match:
                             url = match.group(1).strip().rstrip('.')
-                            response = f"<thought>An MCP tool (like Google Calendar) needs authentication.</thought><answer>⚠️ Одному из инструментов требуется авторизация. Пожалуйста, откройте ссылку в браузере:\n\n{url}\n\nПолучите код и введите его в Telegram командой `/gemini_code <code>` (если это не сработает, попробуйте сначала запустить `/gemini_auth`).</answer>"
+                            response = f"<thought>An MCP tool (like Google Calendar) needs authentication.</thought><answer>⚠️ Одному из инструментов требуется авторизация. Пожалуйста, откройте ссылку в браузере:\n\n{url}\n\nПолучите код и введите его в Telegram командой `/auth_code <code>` (если это не сработает, попробуйте сначала запустить `/auth`).</answer>"
                         else:
-                            response = "<thought>Auth required, but URL not found.</thought><answer>⚠️ Одному из инструментов требуется авторизация, но ссылка не найдена. Пожалуйста, попробуйте выполнить /gemini_auth.</answer>"
+                            response = "<thought>Auth required, but URL not found.</thought><answer>⚠️ Одному из инструментов требуется авторизация, но ссылка не найдена. Пожалуйста, попробуйте выполнить /auth.</answer>"
 
                 if response and "Quota" not in response and "429" not in response and "accounts.google.com/o/oauth2" not in response:
                     # Success
@@ -182,8 +190,8 @@ def process_tasks():
                     maintenance_and_memory(user_dir, history, response)
                     
                     # Auto-commit and push changes
-                    print(f"[{now}] Committing and pushing changes for {user_id}...")
-                    subprocess.run(["python3", "/app/scripts/git_manager.py", "commit", user_id, f"Task {filename} completed"], check=False)
+                    print(f"[{now}] Committing and pushing changes for {user_id}...", flush=True)
+                    subprocess.run([sys.executable, "/app/scripts/git_manager.py", "commit", user_id, f"Task {filename} completed"], check=False)
                 else:
                     # Failure / Quota
                     if response and ("Quota" in response or "429" in response):

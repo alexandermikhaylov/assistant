@@ -1,13 +1,3 @@
-FROM node:22-slim AS bridge-builder
-
-WORKDIR /build
-RUN apt-get update && apt-get install -y git golang && rm -rf /var/lib/apt/lists/*
-
-# Clone WhatsApp MCP (Bridge)
-RUN git clone https://github.com/verygoodplugins/whatsapp-mcp.git
-WORKDIR /build/whatsapp-mcp/whatsapp-bridge
-RUN go build -o main .
-
 # --- Runtime Stage ---
 FROM python:3.11-slim
 

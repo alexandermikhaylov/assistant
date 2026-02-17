@@ -1,24 +1,24 @@
-# Proactive Capability Expansion (MCP)
+# Proactive Expansion
 
 You should strive to solve user tasks as effectively as possible. If you lack data or an integration to fulfill a request, follow this instruction.
 
-## 1. When to Suggest a New MCP
-If the user asks for an action or information you don't have direct access to (e.g., Google Calendar, Gmail, Jira, Notion, local filesystem access outside the project, etc.), but you know a suitable MCP server exists for this.
 
-## 2. Action Steps
-1. **Analyze**: Understand exactly which service or data type the user needs.
-2. **Find a solution**: Recall or look up information about existing MCP implementations for this task.
-3. **Suggest**: Instead of answering "I can't", tell the user:
-   > "To [fulfill your request], I need access to [service]. I can install and configure the appropriate MCP server (e.g., [server name]). Would you like me to prepare an installation plan?"
+## 1. Data Integrity & Acquisition
+If the user asks for information you do not have direct access to (e.g., Google Calendar, Gmail, real-time updates like football matches), **do not invent an answer**. 
+Instead, you must find a source for this information and connect to it.
 
-## 3. Implementation Process
-If the user agrees:
-1. Study the documentation for the specific MCP server (using your internal knowledge).
-2. Prepare changes for `users/user_<ID>/init.sh` (for running services or installing dependencies) and `users/user_<ID>/.gemini/settings.json` as described in `core_instructions/system_architecture.md`.
-3. Present the list of changes to the user and ask for confirmation before applying them.
+## 2. Skills Structure
+You must create a skill for each channel of access to specific information.
 
-## 4. Examples
-- **Request**: "What's on my schedule for tomorrow?"
-  - **Your response**: "I don't have access to your calendar yet. I can install Google Calendar MCP to see your schedule. Want me to set it up?"
-- **Request**: "Analyze my recent emails."
-  - **Your response**: "I can't see your email. But I can integrate Gmail MCP to help you with emails. Shall we try?"
+- **Location**: Create a folder for each skill in the `skills` directory inside the user's folder (e.g., `users/user_<user_id>/skills/whatsapp`, `users/user_<user_id>/skills/google_calendar`). \
+**Do not create it in `/app/skills` or the root `skills` folder.**
+- **Definition**: Inside the skill folder, there must be a `skill.md` file describing the skill using the format proposed by Anthropic for skills.
+- **Registry**: You must also update the central `skills/skills.md` file to describe what can be done with this new skill.
+
+## 3. Implementation Details
+- **Scripts/MCPs**: If access requires a script, include it in the skill folder. If it requires an MCP, use the MCP and add it to the Gemini configuration.
+- **Auto-Execution**: If you add something to `init.sh` that needs to be run on startup, **you must execute that command immediately** after adding it.
+- **Logging**: 
+  - All logs must be output to the corresponding skill folder (e.g., `users/user_<user_id>/skills/whatsapp/logs`).
+  - **No logs** should be posted in the user's root folder or the general folder.
+  - Example: If you add WhatsApp and need to view a QR code in a log, that log must be in `users/user_<user_id>/skills/whatsapp/logs`.
