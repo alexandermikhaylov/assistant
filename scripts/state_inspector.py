@@ -6,13 +6,14 @@ import re
 import glob
 from datetime import datetime
 from utils import strip_ansi
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest
 
 USERS_ROOT = "/app/users"
 CURRENT_TASK_FILE = "/app/data/current_task.json"
 
 def get_current_tasks(user_id=None):
     res = ""
-    # If user_id provided, show only their tasks
     target_dirs = [os.path.join(USERS_ROOT, f"user_{user_id}")] if user_id else glob.glob(os.path.join(USERS_ROOT, "user_*"))
     
     for user_dir in target_dirs:
@@ -68,24 +69,14 @@ def get_full_state(user_id):
     return f"{get_running_status(user_id)}\n\n{get_current_tasks(user_id)}\n\n{get_memories_summary(user_id)}"
 
 def strip_ansi_compat(text):
-    """Compatibility wrapper — delegates to shared utils."""
     return strip_ansi(text)
 
 async def notify_results(bot, send_fn):
     """
-    Scans ALL user directories for completed tasks (in archive) or failed tasks (in active)
-    and sends notifications to the corresponding user.
+    Scans user directories for:
+    1. Active Tasks (in tasks/) -> Update Dashboard (Edit Message)
+    2. Completed Tasks (in archive/) -> Final Result (Edit Message one last time)
     """
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    
-    # Track processed files to avoid duplicate notifications in this runtime session
-    # (In a real DB this would be better, but for now in-memory set + file flag is ok)
-    # Actually rely on 'notified: true' flag in file.
-    
-    # We need a start time reference to avoid notifying old files on restart
-    # But since we check 'notified' flag, we can scan everything.
-    # To be safe, let's look at files modified in the last 24h or just trust the flag.
-    
     while True:
         try:
             user_dirs = glob.glob(os.path.join(USERS_ROOT, "user_*"))
@@ -95,7 +86,8 @@ async def notify_results(bot, send_fn):
                 tasks_dir = os.path.join(user_dir, "tasks")
                 archive_dir = os.path.join(tasks_dir, "archive")
                 
-                for folder in [archive_dir, tasks_dir]:
+                # Check both Active and Archive
+                for folder in [tasks_dir, archive_dir]:
                     if not os.path.exists(folder): continue
                     
                     for filename in os.listdir(folder):
@@ -103,66 +95,121 @@ async def notify_results(bot, send_fn):
                         filepath = os.path.join(folder, filename)
                         
                         try:
+                            # READ FILE
                             with open(filepath, 'r') as f: content = f.read()
-                            if "--- RESULT" not in content: continue
-                            
-                            parts = content.split('---')
-                            if len(parts) < 2: continue
+                            parts = content.split('---', 2)
+                            if len(parts) < 3: continue # Metada + Content required
                             
                             metadata = yaml.safe_load(parts[1]) or {}
-                            if metadata.get('notified'): continue
+                            chat_id = metadata.get('chat_id')
+                            status_msg_id = metadata.get('status_message_id')
+                            last_hash = metadata.get('last_status_hash')
                             
-                            # Parse Result
-                            last_res_block = content.rsplit("--- RESULT", 1)[-1]
-                            res_body = last_res_block.split("\n", 1)[-1].strip()
+                            if not chat_id: continue
+
+                            # PARSE CONTENT
+                            body = content.split('---', 2)[-1]
                             
-                            # Extract <answer>
-                            display_text = ""
-                            answer_match = re.search(r'<answer>(.*?)</answer>', res_body, re.DOTALL | re.IGNORECASE)
-                            if answer_match:
-                                display_text = answer_match.group(1).strip()
+                            # 1. Extract REQUEST (Short summary)
+                            req_match = re.search(r'# Request\n(.*?)\n#', body, re.DOTALL)
+                            req_text = req_match.group(1).strip()[:100] + "..." if req_match else "Processing..."
+                            # Escape HTML in request text to prevent errors
+                            req_text = req_text.replace("<", "&lt;").replace(">", "&gt;")
+                            
+                            # 2. Extract PLAN
+                            plan_match = re.search(r'# Plan\n(.*?)\n#', body, re.DOTALL)
+                            plan_text = plan_match.group(1).strip() if plan_match else ""
+                            
+                            # 3. Extract FINAL RESULT (if any)
+                            result_match = re.search(r'<answer>(.*?)</answer>', body, re.DOTALL | re.IGNORECASE)
+                            final_answer = result_match.group(1).strip() if result_match else None
+                            
+                            # GENERATE DISPLAY TEXT
+                            display_text = f"🤖 <b>Task:</b> {req_text}\n\n"
+                            
+                            if final_answer:
+                                # Task Completed
+                                display_text += f"✅ <b>Done!</b>\n\n{final_answer}"
+                            elif plan_text:
+                                # Task In Progress - Show Plan
+                                display_text += "📋 <b>Plan:</b>\n"
+                                for line in plan_text.splitlines():
+                                    line = line.strip()
+                                    if line.startswith("- [ ]"):
+                                        display_text += f"⬜ {line[5:]}\n"
+                                    elif line.startswith("- [/]"):
+                                        display_text += f"🔄 {line[5:]}\n"
+                                    elif line.startswith("- [x]"):
+                                        display_text += f"✅ <b>{line[5:]}</b>\n"
+                                    elif line.startswith("- [!]"):
+                                        display_text += f"❌ {line[5:]}\n"
                             else:
-                                # Fallback: try to find non-tag text
-                                display_text = re.sub(r'<thought>.*?</thought>', '', res_body, flags=re.DOTALL).strip()
+                                display_text += "⏳ <i>Initializing...</i>"
 
-                            if not display_text: continue
-                            
-                            display_text = strip_ansi(display_text)
+                            # HASH CHECK to avoid spamming edits if nothing changed
+                            current_hash = hash(display_text)
+                            if str(current_hash) == str(last_hash):
+                                continue
 
-                            # Prepare Buttons
+                            # SEND / EDIT
                             builder = InlineKeyboardBuilder()
-                            # Check for structured <confirm> tag
-                            is_conf = False
-                            confirm_match = re.search(r'<confirm>(.*?)</confirm>', display_text, re.DOTALL | re.IGNORECASE)
+                            # Check for Confirmation
+                            confirm_match = re.search(r'<confirm>(.*?)</confirm>', body, re.DOTALL)
                             if confirm_match:
-                                # Remove the <confirm> tag from displayed text
-                                display_text = re.sub(r'<confirm>.*?</confirm>', '', display_text, flags=re.DOTALL | re.IGNORECASE).strip()
-                                builder.button(text="✅ Да", callback_data=f"conf_yes_{filename}")
-                                builder.button(text="❌ Нет", callback_data=f"conf_no_{filename}")
-                                is_conf = True
+                                display_text += f"\n\n❓ <b>Confirm:</b> {confirm_match.group(1)}" # Show pure text
+                                # We remove confirm tag from display to avoid double showing if formatting matches
+                                # But actually we want it shown.
+                                builder.button(text="✅ Yes", callback_data=f"conf_yes_{filename}")
+                                builder.button(text="❌ No", callback_data=f"conf_no_{filename}")
+                                builder.adjust(2)
 
-                            # Send
+                            sent_msg = None
                             try:
-                                sent = await send_fn(user_id, display_text, metadata.get('message_id'), builder.as_markup() if is_conf else None)
-                                if sent:
-                                    metadata['notified'] = True
-                                    metadata['last_ai_message_id'] = sent.message_id
+                                if status_msg_id:
+                                    # EDIT
+                                    if display_text != "SAME": # Pseudo-check
+                                        await bot.edit_message_text(
+                                            chat_id=chat_id,
+                                            message_id=status_msg_id,
+                                            text=display_text,
+                                            parse_mode="HTML",
+                                            reply_markup=builder.as_markup() if confirm_match else None
+                                        )
+                                        sent_msg = type('obj', (object,), {'message_id': status_msg_id})
+                                else:
+                                    # SEND NEW
+                                    sent_msg = await bot.send_message(
+                                        chat_id=chat_id,
+                                        text=display_text,
+                                        parse_mode="HTML",
+                                        reply_markup=builder.as_markup() if confirm_match else None
+                                    )
+                                
+                                # UPDATE METADATA
+                                if sent_msg:
+                                    metadata['status_message_id'] = sent_msg.message_id
+                                    metadata['last_status_hash'] = str(current_hash)
                                     
-                                    # Update file safely
-                                    # We reconstruct: --- \n metadata \n --- \n rest
-                                    # Find where first metadata block ends
-                                    _, _, rest = content.split('---', 2)
-                                    new_content = f"--- \n{yaml.dump(metadata, allow_unicode=True)}--- \n{rest.strip()}\n"
+                                    # Re-save file
+                                    # CAREFUL: We must only update metadata block
+                                    new_meta = yaml.dump(metadata, allow_unicode=True)
+                                    new_content = f"--- \n{new_meta}--- {body}"
                                     
                                     with open(filepath, 'w') as f: f.write(new_content)
-                                    print(f"--- [NOTIFY] Sent to {user_id}: {filename}")
-                            except Exception as send_err:
-                                print(f"Failed to send to {user_id}: {send_err}")
+                                    # print(f"Updated status for {filename}")
+
+                            except TelegramBadRequest as e:
+                                if "message is not modified" in str(e):
+                                    pass # Ignore
+                                else:
+                                    print(f"Tg Error: {e}")
+                            except Exception as e:
+                                print(f"Notify Error details: {e}")
 
                         except Exception as fe:
-                            print(f"Error checking file {filename}: {fe}")
-
+                            pass # File read error
+                            
         except Exception as e:
             print(f"Notify loop error: {e}")
         
-        await asyncio.sleep(5)
+        await asyncio.sleep(2)

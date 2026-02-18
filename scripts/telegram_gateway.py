@@ -47,7 +47,7 @@ def is_user_allowed(user_id):
     """Checks if the user_id is in the whitelist."""
     if not os.path.exists(ALLOWED_USERS_FILE):
         log_tg(f"⚠️ Warning: {ALLOWED_USERS_FILE} not found. Allowing everyone (DEBUG mode).")
-        return False
+        return True
         
     try:
         with open(ALLOWED_USERS_FILE, 'r') as f:
@@ -190,14 +190,17 @@ async def handle_onboarding_message(message: types.Message):
         task_filename = f"onboarding_profile_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
         
         task_content = (
-            f"# User Onboarding Profile & Analysis\n\n"
+            f"# Request\n"
+            f"User Onboarding Profile & Analysis\n\n"
             f"The user has just finished onboarding. They provided the following description of their interests:\n"
             f"> {text}\n\n"
             f"**Your Goal:**\n"
             f"1. Create a file `memories/initial_profile.md` containing extracted facts about the user's interests.\n"
             f"2. Analyze their needs and suggest 2-3 specific MCP tools that might be useful (e.g. Football API, Spotify, advanced coding tools, etc.).\n"
             f"3. Create a file `instructions/suggested_tools.md` with these recommendations and how to install them (briefly).\n"
-            f"4. Reply to the user with a friendly welcome message, confirming you understood their interests, and listing your recommendations.\n"
+            f"4. Reply to the user with a friendly welcome message, confirming you understood their interests, and listing your recommendations.\n\n"
+            f"# Plan\n\n"
+            f"# History\n"
         )
         
         metadata = {"message_id": message.message_id, "chat_id": message.chat.id, "user_id": user_id}
@@ -667,25 +670,43 @@ async def handle_message(message: types.Message):
     user_id = str(message.from_user.id)
     paths = ensure_user_structure(message.from_user.id)
     
-    target_msg_id = message.reply_to_message.message_id if message.reply_to_message else None
-    task_path = find_task_by_msg_id(user_id, target_msg_id)
+    # Defaults
+    parent_task_id = None
     
-    if task_path:
-        if paths["archive"] in task_path:
-            new_path = os.path.join(paths["tasks"], os.path.basename(task_path))
-            os.rename(task_path, new_path)
-            task_path = new_path
-        with open(task_path, 'a') as f:
-            f.write(f"\n\n--- USER REPLY ---\n{message.text}\n")
-        try: await message.react(reaction=[types.ReactionTypeEmoji(emoji="✍️")])
-        except Exception: pass
-    else:
-        task_filename = f"tg_task_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-        metadata = {"message_id": message.message_id, "chat_id": message.chat.id, "user_id": user_id}
-        with open(os.path.join(paths["tasks"], task_filename), "w") as f:
-            f.write(f"--- \n{yaml.dump(metadata, allow_unicode=True)}--- \n\n{message.text}\n")
-        try: await message.react(reaction=[types.ReactionTypeEmoji(emoji="✍️")])
-        except: pass
+    # Check for Reply -> Parent Task logic
+    if message.reply_to_message:
+        target_msg_id = message.reply_to_message.message_id
+        parent_path = find_task_by_msg_id(user_id, target_msg_id)
+        if parent_path:
+            parent_task_id = os.path.basename(parent_path)
+    
+    # Always create a NEW task
+    task_filename = f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{hashlib.md5(message.text.encode()).hexdigest()[:4]}.md"
+    
+    metadata = {
+        "task_id": task_filename, # using filename as ID for simplicity
+        "user_id": user_id,
+        "chat_id": message.chat.id,
+        "trigger_message_id": message.message_id,
+        "parent_task_id": parent_task_id,
+        "status": "planning", # Start in planning mode
+        "created_at": datetime.now().isoformat()
+    }
+    
+    # Initial Content Structure
+    file_content = (
+        f"--- \n{yaml.dump(metadata, allow_unicode=True)}--- \n\n"
+        f"# Request\n{message.text}\n\n"
+        f"# Plan\n\n" # Empty plan signals the runner to generate one
+        f"# History\n"
+    )
+
+    with open(os.path.join(paths["tasks"], task_filename), "w") as f:
+        f.write(file_content)
+    
+    # React to confirm receipt
+    try: await message.react(reaction=[types.ReactionTypeEmoji(emoji="👀")])
+    except: pass
 
 async def main():
     log_tg("Bot starting (Multi-user mode ready)...")

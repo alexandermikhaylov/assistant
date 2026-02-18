@@ -6,13 +6,13 @@ import json
 import subprocess
 import time
 import glob
-from datetime import datetime, timedelta
+from datetime import datetime
+from utils import strip_ansi
 
 USERS_ROOT = "/app/users"
 CORE_INSTRUCTIONS_DIR = "/app/core_instructions"
 CURRENT_TASK_FILE = "/app/data/current_task.json"
 GEMINI_BIN = "gemini"
-
 
 def set_current_task(filename, user_id):
     with open(CURRENT_TASK_FILE, 'w') as f:
@@ -24,7 +24,7 @@ def clear_current_task():
 
 def get_context(user_dir):
     ctx = ""
-    # 1. Global/Core Instructions
+    # 1. Global Interactions (Instructions)
     if os.path.exists(CORE_INSTRUCTIONS_DIR):
         for f in sorted(os.listdir(CORE_INSTRUCTIONS_DIR)):
             if f.endswith(".md"):
@@ -47,7 +47,7 @@ def get_context(user_dir):
                 with open(os.path.join(mem_dir, f), 'r') as file:
                     ctx += f"\nFILE {f} (from user_memories):\n{file.read()}\n"
 
-    # 4. User Skills (Available Capabilities)
+    # 4. Skills
     skills_file = os.path.join(user_dir, "skills", "skills.md")
     if os.path.exists(skills_file):
         with open(skills_file, 'r') as file:
@@ -59,64 +59,48 @@ def run_gemini(prompt, user_dir, yolo=True, timeout=300):
     args = [GEMINI_BIN]
     if yolo: args.append("-y")
     
-    # ISOLATION MAGIC:
-    # Set HOME to the user's directory so Gemini CLI finds .gemini/settings.json THERE.
     env = os.environ.copy()
     env['HOME'] = user_dir
     
     try:
         result = subprocess.run(args, input=prompt, capture_output=True, text=True, timeout=timeout, env=env)
-        if result.returncode != 0:
-            print(f"Gemini returned error code {result.returncode}: {result.stderr}")
         return result.stdout.strip()
     except Exception as e:
         print(f"Gemini subprocess error: {e}")
         return ""
 
+def load_parent_context(user_dir, parent_task_id):
+    if not parent_task_id: return ""
+    
+    # Check Active then Archive
+    paths = [
+        os.path.join(user_dir, "tasks", parent_task_id),
+        os.path.join(user_dir, "tasks", "archive", parent_task_id)
+    ]
+    
+    for path in paths:
+        if os.path.exists(path):
+            with open(path, 'r') as f: content = f.read()
+            # Try to extract <answer> (Final Result) or full history
+            # For context, we probably want the User Request + Final Answer
+            
+            parts = content.split('---')
+            if len(parts) >= 3:
+                body = parts[2]
+                req_match = re.search(r'# Request\n(.*?)\n#', body, re.DOTALL)
+                req_text = req_match.group(1).strip() if req_match else "Unknown Request"
+                
+                ans_match = re.search(r'<answer>(.*?)</answer>', body, re.DOTALL | re.IGNORECASE)
+                ans_text = ans_match.group(1).strip() if ans_match else "No Answer"
+                
+                return f"\n\n--- PREVIOUS CONVERSATION ---\nUser: {req_text}\nAssistant: {ans_text}\n----------------------------\n"
+            return ""
+            
+    return ""
+
 def maintenance_and_memory(user_dir, task_content, task_result):
-    """Extract and save new facts about the user from a completed task."""
-    if "Emoji: 👎" in task_content:
-        return
-    
-    memories_dir = os.path.join(user_dir, "memories")
-    os.makedirs(memories_dir, exist_ok=True)
-    
-    # Load existing memories for context
-    existing_memories = ""
-    if os.path.exists(memories_dir):
-        for f in sorted(os.listdir(memories_dir)):
-            if f.endswith(".md"):
-                try:
-                    with open(os.path.join(memories_dir, f), 'r') as mf:
-                        existing_memories += f"\n{mf.read()}"
-                except Exception:
-                    pass
-    
-    prompt = (
-        "You are a memory extraction agent. Your ONLY job is to extract new, important facts "
-        "about the user from a conversation. These facts should be useful for future interactions.\n\n"
-        "Rules:\n"
-        "- Only extract PERSONAL facts (name, preferences, schedule, contacts, habits).\n"
-        "- Do NOT extract task-specific operational details.\n"
-        "- Do NOT repeat facts already known.\n"
-        "- If no new facts are found, respond with exactly: NO_NEW_FACTS\n"
-        "- If facts are found, respond with one fact per line, each starting with '- '.\n\n"
-        f"EXISTING MEMORIES:\n{existing_memories if existing_memories else '(none)'}\n\n"
-        f"CONVERSATION:\n{task_content}\n\n"
-        f"AI RESPONSE:\n{task_result}\n\n"
-        "NEW FACTS (or NO_NEW_FACTS):"
-    )
-    
-    try:
-        result = run_gemini(prompt, user_dir, yolo=True, timeout=60)
-        if result and "NO_NEW_FACTS" not in result:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            memory_file = os.path.join(memories_dir, f"auto_{timestamp}.md")
-            with open(memory_file, 'w') as f:
-                f.write(f"# Auto-extracted ({datetime.now().strftime('%Y-%m-%d %H:%M')})\n\n{result}\n")
-            print(f"[Memory] Saved new facts to {memory_file}")
-    except Exception as e:
-        print(f"[Memory] Error extracting memories: {e}")
+    # Simplified for now - can be expanded later
+    pass
 
 def process_tasks():
     user_dirs = glob.glob(os.path.join(USERS_ROOT, "user_*"))
@@ -129,7 +113,8 @@ def process_tasks():
         if not os.path.exists(tasks_dir): continue
 
         files = [f for f in os.listdir(tasks_dir) if f.endswith(".md") and os.path.isfile(os.path.join(tasks_dir, f))]
-        files.sort(key=lambda x: (not x.startswith("tg_task_"), x))
+        # Prioritize older tasks? Or user logic.
+        files.sort() 
         
         if not files: continue
 
@@ -138,87 +123,165 @@ def process_tasks():
         for filename in files:
             filepath = os.path.join(tasks_dir, filename)
             with open(filepath, 'r') as f: content = f.read()
-            try:
-                parts = content.split('---', 2)
-                if len(parts) < 3: continue
-                
-                metadata = yaml.safe_load(parts[1]) or {}
-                
-                # Check retry logic
-                now = datetime.now()
-                next_retry = metadata.get('next_retry_at')
-                if next_retry and now < datetime.fromisoformat(next_retry): continue
+            
+            # Split ONLY on the first two '---' (YAML frontmatter delimiters)
+            # This preserves any '---' inside the body (e.g. --- RESULT ---, --- USER REACTION ---)
+            parts = content.split('---', 2)
+            if len(parts) < 3: continue
+            
+            metadata = yaml.safe_load(parts[1]) or {}
+            
+            # CHECK BLOCKED STATUS (User Confirmation)
+            if "<confirm>" in content and "--- USER DECISION ---" not in content.split("<confirm>")[-1]:
+                continue
 
-                metadata['notified'] = False
-                history = parts[2].strip()
-                
-                print(f"[{datetime.now()}] Processing {filename} for {user_id}")
-                set_current_task(filename, user_id)
-                
-                last_run = metadata.get('last_run_timestamp', "unknown")
-                prompt = f"{user_ctx}\n\nCURRENT TIME: {now}\nLAST RUN: {last_run}\n"
-                prompt += "INSTRUCTION: YOU MUST use XML tags <thought> and <answer> for your output. The <answer> tag contains what the user sees. The <thought> tag contains your reasoning and tool calls.\n"
-                prompt += "Do not write Python code (like print(default_api...)) to invoke tools; use the native tool calling mechanism provided.\n\n"
-                prompt += f"HISTORY:\n{history}\n\n"
-                prompt += "IMPORTANT: Ignore any previous history that does not follow the XML format. Your response MUST start with <thought> and end with </answer>.\n"
-                prompt += "ANSWER:"
+            set_current_task(filename, user_id)
+            print(f"Processing {filename}...")
 
-                # PASS USER_DIR HERE
-                response = run_gemini(prompt, user_dir)
+            body = parts[2]
+            
+            # 1. PARSE SECTIONS
+            req_match = re.search(r'# Request\n(.*?)\n#', body, re.DOTALL)
+            request_text = req_match.group(1).strip() if req_match else ""
+            
+            plan_match = re.search(r'# Plan\n(.*?)\n#', body, re.DOTALL)
+            plan_text = plan_match.group(1).strip() if plan_match else ""
+            
+            history_match = re.search(r'# History\n(.*)', body, re.DOTALL)
+            history_text = history_match.group(1).strip() if history_match else ""
+
+            # 2. STATE MACHINE
+            
+            # STEP A: GENERATE PLAN
+            if not plan_text:
+                print("Generating Plan...")
+                parent_ctx = load_parent_context(user_dir, metadata.get('parent_task_id'))
                 
-                # Check for OAuth requirement in response
-                if "accounts.google.com/o/oauth2" in response:
-                    print(f"[{now}] OAuth required for user {user_id}. Distinguishing...")
-                    # 681255809395 is the Gemini CLI Client ID
-                    if "681255809395" in response:
-                        response = "<thought>Gemini CLI needs authentication.</thought><answer>⚠️ Пожалуйста, используйте команду /auth для авторизации, и тогда всё заработает.</answer>"
+                prompt = (
+                    f"{user_ctx}\n{parent_ctx}\n"
+                    f"USER REQUEST: {request_text}\n\n"
+                    "INSTRUCTION: Create a checklist plan to solve the user's request. "
+                    "Break it down into atomic steps (search, analyze, execute). "
+                    "Output ONLY the markdown list, e.g.:\n- [ ] Step 1\n- [ ] Step 2\n"
+                )
+                
+                plan = run_gemini(prompt, user_dir)
+                if plan:
+                    # Save Plan
+                    if "# Plan" in body:
+                        new_body = re.sub(r'# Plan\s*\n', f'# Plan\n{plan}\n\n', body, count=1)
                     else:
-                        # Extract the URL
-                        match = re.search(r'(https://[^\s]*google\.com/[^\s]*oauth[^\s]*)', response, re.IGNORECASE)
-                        if match:
-                            url = match.group(1).strip().rstrip('.')
-                            response = f"<thought>An MCP tool (like Google Calendar) needs authentication.</thought><answer>⚠️ Одному из инструментов требуется авторизация. Пожалуйста, откройте ссылку в браузере:\n\n{url}\n\nПолучите код и введите его в Telegram командой `/auth_code <code>` (если это не сработает, попробуйте сначала запустить `/auth`).</answer>"
-                        else:
-                            response = "<thought>Auth required, but URL not found.</thought><answer>⚠️ Одному из инструментов требуется авторизация, но ссылка не найдена. Пожалуйста, попробуйте выполнить /auth.</answer>"
-
-                if response and "Quota" not in response and "429" not in response and "accounts.google.com/o/oauth2" not in response:
-                    # Success
-                    metadata.pop('first_failed_at', None); metadata.pop('next_retry_at', None)
-                    with open(filepath, "w") as f:
-                        f.write(f"--- \n{yaml.dump(metadata, allow_unicode=True)}--- \n{history}\n\n--- RESULT ({now}) ---\n{response}\n")
-                    if not os.path.exists(archive_dir): os.makedirs(archive_dir)
-                    os.rename(filepath, os.path.join(archive_dir, filename))
+                        # Fallback for legacy/malformed files: Append sections
+                        new_body = body.strip() + f"\n\n# Plan\n{plan}\n\n# History\n"
                     
-                    # Update memory with facts from this interaction
-                    maintenance_and_memory(user_dir, history, response)
-                    
-                    # Auto-commit and push changes
-                    print(f"[{now}] Committing and pushing changes for {user_id}...", flush=True)
-                    subprocess.run([sys.executable, "/app/scripts/git_manager.py", "commit", user_id, f"Task {filename} completed"], check=False)
-                else:
-                    # Failure / Quota
-                    if response and ("Quota" in response or "429" in response):
-                        print(f"[{now}] Quota limit for {user_id}. Sleeping task 1h.")
-                        metadata['next_retry_at'] = (now + timedelta(hours=1)).isoformat()
-                        if not metadata.get('notified'):
-                             # Notification logic placeholder
-                             pass
-                        with open(filepath, "w") as f:
-                            f.write(f"--- \n{yaml.dump(metadata, allow_unicode=True)}--- \n{history}\n")
-                    else:
-                        # Retry logic (15m)
-                        print(f"[{now}] Task failed. Retrying in 15m.")
-                        metadata['next_retry_at'] = (now + timedelta(minutes=15)).isoformat()
-                        metadata['notified'] = False
-                        with open(filepath, "w") as f:
-                             f.write(f"--- \n{yaml.dump(metadata, allow_unicode=True)}--- \n{history}\n\n--- RESULT ---\n<thought>Error.</thought><answer>⚠️ Ошибка. Повторю через 15 мин.</answer>\n")
+                    with open(filepath, 'w') as f:
+                        f.write(f"--- \n{yaml.dump(metadata, allow_unicode=True)}--- \n{new_body}")
+                continue # Loop will pick it up next time/tick
 
+            # STEP B: EXECUTE NEXT ITEM
+            lines = plan_text.splitlines()
+            next_step_idx = -1
+            next_step_text = ""
+            
+            # Find first unchecked OR stuck-in-progress item
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith("- [ ]"):
+                    next_step_idx = i
+                    next_step_text = stripped[5:].strip()
+                    break
+                elif stripped.startswith("- [/]"):
+                    # Crashed mid-execution: treat as unchecked, re-execute
+                    next_step_idx = i
+                    next_step_text = stripped[5:].strip()
+                    # Reset to unchecked first
+                    lines[i] = line.replace("- [/]", "- [ ]")
+                    break
+            
+            if next_step_idx != -1:
+                # Mark as In Progress [/]
+                lines[next_step_idx] = lines[next_step_idx].replace("- [ ]", "- [/]")
+                new_plan_text = "\n".join(lines)
+                
+                # Update File (Tick)
+                body = re.sub(r'# Plan\n(.*?)\n#', f'# Plan\n{new_plan_text}\n#', body, flags=re.DOTALL)
+                with open(filepath, 'w') as f:
+                    f.write(f"--- \n{yaml.dump(metadata, allow_unicode=True)}--- {body}")
+                
+                # Execute
+                print(f"Executing step: {next_step_text}")
+                
+                # Check for User Decision Context
+                decision_ctx = ""
+                if "--- USER DECISION ---" in history_text:
+                     last_decision = history_text.split("--- USER DECISION ---")[-1].strip()
+                     decision_ctx = f"\nUSER DECISION ON PREVIOUS CONFIRMATION: {last_decision}\n"
+
+                prompt = (
+                    f"{user_ctx}\n"
+                    f"OBJECTIVE: {request_text}\n"
+                    f"CURRENT PLAN:\n{new_plan_text}\n"
+                    f"CURRENT STEP: {next_step_text}\n"
+                    f"HISTORY SO FAR:\n{history_text}\n"
+                    f"{decision_ctx}\n"
+                    "INSTRUCTION: Execute this step. Output PLAIN TEXT or TOOL CALLS. "
+                    "Do NOT use <thought> or <answer> tags."
+                )
+                
+                result = run_gemini(prompt, user_dir)
+                
+                # Save Result
+                # Mark as Done [x]
+                lines[next_step_idx] = lines[next_step_idx].replace("- [/]", "- [x]")
+                final_plan_text = "\n".join(lines)
+                
+                new_history = f"{history_text}\n\n## {next_step_text}\n{result}\n"
+                
+                body = re.sub(r'# Plan\n(.*?)\n#', f'# Plan\n{final_plan_text}\n#', body, flags=re.DOTALL)
+                body = re.sub(r'# History\n(.*)', f'# History\n{new_history}', body, flags=re.DOTALL)
+                
+                with open(filepath, 'w') as f:
+                    f.write(f"--- \n{yaml.dump(metadata, allow_unicode=True)}--- {body}")
+                
                 clear_current_task()
-            except Exception as e:
-                print(f"Error processing {filename}: {e}")
-                clear_current_task()
+                continue 
+
+            # STEP C: FINALIZE (No unchecked/in-progress items remain)
+            # Check <answer> in FULL content, not just history_text (Gemini may have
+            # leaked it into step output or it could be in a RESULT block)
+            has_answer = "<answer>" in content
+            
+            if not has_answer:
+                print("Finalizing...")
+                prompt = (
+                    f"{user_ctx}\n"
+                    f"OBJECTIVE: {request_text}\n"
+                    f"The plan is complete.\n"
+                    f"HISTORY:\n{history_text}\n"
+                    "INSTRUCTION: Provide the FINAL ANSWER to the user. "
+                    "Use <thought> for reasoning and <answer> for the message. "
+                    "Use HTML formatting."
+                )
+                
+                result = run_gemini(prompt, user_dir)
+                
+                with open(filepath, 'a') as f:
+                    f.write(f"\n\n--- RESULT ({datetime.now().strftime('%H:%M')}) ---\n{result}\n")
+            
+            # Archive (whether we just finalized or it was already done)
+            print(f"Archiving {filename}...")
+            if not os.path.exists(archive_dir): os.makedirs(archive_dir)
+            os.rename(filepath, os.path.join(archive_dir, filename))
+            
+            # Maintenance (Auto Commit)
+            subprocess.run([sys.executable, "/app/scripts/git_manager.py", "commit", user_id, f"Task {filename} completed"], check=False)
+            
+            clear_current_task()
 
 if __name__ == "__main__":
     while True:
-        process_tasks()
-        time.sleep(10)
+        try:
+            process_tasks()
+        except Exception as e:
+            print(f"Runner Loop Error: {e}")
+        time.sleep(2)
