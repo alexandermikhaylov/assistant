@@ -157,8 +157,11 @@ def process_tasks():
                 
                 last_run = metadata.get('last_run_timestamp', "unknown")
                 prompt = f"{user_ctx}\n\nCURRENT TIME: {now}\nLAST RUN: {last_run}\n"
-                prompt += "INSTRUCTION: Use XML tags <thought> and <answer>. Do not write Python code (like print(default_api...)) to invoke tools; use the native tool calling mechanism provided.\n\n"
-                prompt += f"HISTORY:\n{history}\n\nANSWER:"
+                prompt += "INSTRUCTION: YOU MUST use XML tags <thought> and <answer> for your output. The <answer> tag contains what the user sees. The <thought> tag contains your reasoning and tool calls.\n"
+                prompt += "Do not write Python code (like print(default_api...)) to invoke tools; use the native tool calling mechanism provided.\n\n"
+                prompt += f"HISTORY:\n{history}\n\n"
+                prompt += "IMPORTANT: Ignore any previous history that does not follow the XML format. Your response MUST start with <thought> and end with </answer>.\n"
+                prompt += "ANSWER:"
 
                 # PASS USER_DIR HERE
                 response = run_gemini(prompt, user_dir)
