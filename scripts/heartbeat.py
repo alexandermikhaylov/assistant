@@ -70,6 +70,30 @@ def check_recurrent_tasks():
                     if len(parts) < 3: continue
                     metadata = yaml.safe_load(parts[1])
                     
+                    # --- DEFERRED TASKS (run_after) ---
+                    run_after = metadata.get('run_after')
+                    if run_after:
+                        try:
+                            run_after_dt = datetime.fromisoformat(run_after)
+                            if datetime.now() >= run_after_dt:
+                                print(f"[{datetime.now()}] Deferred task ready: {filename} for {os.path.basename(user_dir)}")
+                                # Remove run_after so it processes normally
+                                del metadata['run_after']
+                                metadata['status'] = 'planning'
+                                new_content = f"--- \n{yaml.dump(metadata, allow_unicode=True)}--- {parts[2]}"
+                                
+                                # Move back to tasks/
+                                dest = os.path.join(tasks_dir, filename)
+                                with open(dest, 'w') as nf:
+                                    nf.write(new_content)
+                                os.remove(filepath)
+                                print(f"  -> Moved {filename} back to tasks/")
+                            # else: not yet time, skip
+                        except Exception as e:
+                            print(f"Error handling run_after for {filename}: {e}")
+                        continue  # Skip schedule check for deferred tasks
+                    
+                    # --- SCHEDULED TASKS ---
                     run_needed, run_time_str = should_run(filename, metadata, state)
                     if run_needed:
                         print(f"[{datetime.now()}] Spawning recurrent {filename} for {os.path.basename(user_dir)}")

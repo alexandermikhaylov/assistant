@@ -77,11 +77,37 @@ async def notify_results(bot, send_fn):
     1. Active Tasks (in tasks/) -> Update Dashboard (Edit Message)
     2. Completed Tasks (in archive/) -> Final Result (Edit Message one last time)
     """
+    from aiogram.exceptions import TelegramRetryAfter
+    import time as _time
+    
+    # Per-chat cooldown: chat_id -> timestamp of last successful edit
+    _last_edit = {}
+    MIN_EDIT_INTERVAL = 5  # seconds between edits per chat
+    NOTIF_DIR = "/app/data/notifications"
+    
     while True:
         try:
+            # Process notification queue (from task_runner)
+            if os.path.exists(NOTIF_DIR):
+                for nf_name in os.listdir(NOTIF_DIR):
+                    if not nf_name.endswith(".json"): continue
+                    nf_path = os.path.join(NOTIF_DIR, nf_name)
+                    try:
+                        with open(nf_path, 'r') as f:
+                            notif = json.load(f)
+                        await bot.send_message(
+                            chat_id=int(notif["chat_id"]),
+                            text=notif["text"],
+                            parse_mode=notif.get("parse_mode", "HTML")
+                        )
+                        os.remove(nf_path)
+                    except Exception as ne:
+                        print(f"Notification send error: {ne}", flush=True)
+                        os.remove(nf_path)  # Remove even on error to avoid infinite retry
             user_dirs = glob.glob(os.path.join(USERS_ROOT, "user_*"))
             for user_dir in user_dirs:
                 user_id = os.path.basename(user_dir).replace("user_", "")
+
                 
                 tasks_dir = os.path.join(user_dir, "tasks")
                 archive_dir = os.path.join(tasks_dir, "archive")
@@ -124,6 +150,21 @@ async def notify_results(bot, send_fn):
                             result_match = re.search(r'<answer>(.*?)</answer>', body, re.DOTALL | re.IGNORECASE)
                             final_answer = result_match.group(1).strip() if result_match else None
                             
+                            # Sanitize final_answer: only allow Telegram-supported HTML tags
+                            if final_answer:
+                                import html
+                                # First escape everything
+                                safe = html.escape(final_answer)
+                                # Then restore only Telegram-supported tags
+                                tg_tags = ['b', 'i', 'u', 's', 'a', 'code', 'pre', 'blockquote']
+                                for tag in tg_tags:
+                                    safe = safe.replace(f'&lt;{tag}&gt;', f'<{tag}>')
+                                    safe = safe.replace(f'&lt;{tag} ', f'<{tag} ')  # tags with attributes like <a href>
+                                    safe = safe.replace(f'&lt;/{tag}&gt;', f'</{tag}>')
+                                # Restore href attributes in <a> tags (escaped quotes)
+                                safe = re.sub(r'<a\s+href=&quot;(.*?)&quot;', r'<a href="\1"', safe)
+                                final_answer = safe
+                            
                             # GENERATE DISPLAY TEXT
                             display_text = f"🤖 <b>Task:</b> {req_text}\n\n"
                             
@@ -132,17 +173,23 @@ async def notify_results(bot, send_fn):
                                 display_text += f"✅ <b>Done!</b>\n\n{final_answer}"
                             elif plan_text:
                                 # Task In Progress - Show Plan
+                                import html as _html
                                 display_text += "📋 <b>Plan:</b>\n"
                                 for line in plan_text.splitlines():
                                     line = line.strip()
+                                    step = ""
                                     if line.startswith("- [ ]"):
-                                        display_text += f"⬜ {line[5:]}\n"
+                                        step = _html.escape(line[5:])
+                                        display_text += f"⬜ {step}\n"
                                     elif line.startswith("- [/]"):
-                                        display_text += f"🔄 {line[5:]}\n"
+                                        step = _html.escape(line[5:])
+                                        display_text += f"🔄 {step}\n"
                                     elif line.startswith("- [x]"):
-                                        display_text += f"✅ <b>{line[5:]}</b>\n"
+                                        step = _html.escape(line[5:])
+                                        display_text += f"✅ <b>{step}</b>\n"
                                     elif line.startswith("- [!]"):
-                                        display_text += f"❌ {line[5:]}\n"
+                                        step = _html.escape(line[5:])
+                                        display_text += f"❌ {step}\n"
                             else:
                                 display_text += "⏳ <i>Initializing...</i>"
 
@@ -163,19 +210,24 @@ async def notify_results(bot, send_fn):
                                 builder.button(text="❌ No", callback_data=f"conf_no_{filename}")
                                 builder.adjust(2)
 
+                            # Rate limit: skip if we edited this chat too recently
+                            chat_key = str(chat_id)
+                            now = _time.time()
+                            if chat_key in _last_edit and (now - _last_edit[chat_key]) < MIN_EDIT_INTERVAL:
+                                continue
+
                             sent_msg = None
                             try:
                                 if status_msg_id:
                                     # EDIT
-                                    if display_text != "SAME": # Pseudo-check
-                                        await bot.edit_message_text(
-                                            chat_id=chat_id,
-                                            message_id=status_msg_id,
-                                            text=display_text,
-                                            parse_mode="HTML",
-                                            reply_markup=builder.as_markup() if confirm_match else None
-                                        )
-                                        sent_msg = type('obj', (object,), {'message_id': status_msg_id})
+                                    await bot.edit_message_text(
+                                        chat_id=chat_id,
+                                        message_id=status_msg_id,
+                                        text=display_text,
+                                        parse_mode="HTML",
+                                        reply_markup=builder.as_markup() if confirm_match else None
+                                    )
+                                    sent_msg = type('obj', (object,), {'message_id': status_msg_id})
                                 else:
                                     # SEND NEW
                                     sent_msg = await bot.send_message(
@@ -185,22 +237,31 @@ async def notify_results(bot, send_fn):
                                         reply_markup=builder.as_markup() if confirm_match else None
                                     )
                                 
+                                _last_edit[chat_key] = _time.time()
+                                
                                 # UPDATE METADATA
                                 if sent_msg:
                                     metadata['status_message_id'] = sent_msg.message_id
                                     metadata['last_status_hash'] = str(current_hash)
                                     
-                                    # Re-save file
-                                    # CAREFUL: We must only update metadata block
                                     new_meta = yaml.dump(metadata, allow_unicode=True)
                                     new_content = f"--- \n{new_meta}--- {body}"
                                     
                                     with open(filepath, 'w') as f: f.write(new_content)
-                                    # print(f"Updated status for {filename}")
 
+                            except TelegramRetryAfter as e:
+                                # Telegram told us exactly how long to wait
+                                wait = e.retry_after + 1
+                                print(f"Rate limited. Waiting {wait}s.", flush=True)
+                                _last_edit[chat_key] = _time.time() + wait
+                                await asyncio.sleep(wait)
                             except TelegramBadRequest as e:
                                 if "message is not modified" in str(e):
-                                    pass # Ignore
+                                    # Content identical, update hash to avoid retrying
+                                    metadata['last_status_hash'] = str(current_hash)
+                                    new_meta = yaml.dump(metadata, allow_unicode=True)
+                                    new_content = f"--- \n{new_meta}--- {body}"
+                                    with open(filepath, 'w') as f: f.write(new_content)
                                 else:
                                     print(f"Tg Error: {e}")
                             except Exception as e:
@@ -212,4 +273,4 @@ async def notify_results(bot, send_fn):
         except Exception as e:
             print(f"Notify loop error: {e}")
         
-        await asyncio.sleep(2)
+        await asyncio.sleep(5)

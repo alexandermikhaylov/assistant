@@ -24,7 +24,8 @@ You are an autonomous AI assistant capable of modifying your own configuration a
 - **State Inspector**: Provides system status visibility without LLM involvement.
 
 ## 3. Extending Capabilities (Adding New MCP)
-If a user asks to add a new service (e.g., Google Calendar):
+If a user asks to add a new service (e.g., WhatsApp, Google Calendar):
+0. **Check `/app/skills_library/`** first — if an installation guide exists for the requested skill, follow its `INSTALL.md` step-by-step.
 1. **users/user_<ID>/init.sh**: Add dependency installation commands (pip, npm) or background process launchers here, to avoid modifying the global `Dockerfile`.
 2. **users/user_<ID>/.gemini/settings.json**: Register the new server in the `mcpServers` section so Gemini CLI can invoke its tools.
 3. **core_instructions/mcp_usage.md**: Add usage rules for the new tools.

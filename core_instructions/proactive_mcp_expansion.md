@@ -7,6 +7,9 @@ You should strive to solve user tasks as effectively as possible. If you lack da
 If the user asks for information you do not have direct access to (e.g., Google Calendar, Gmail, real-time updates like football matches), **do not invent an answer**. 
 Instead, you must find a source for this information and connect to it.
 
+### Check Skills Library First
+Before creating a new skill from scratch, **always check `/app/skills_library/`** for an existing installation guide. If one exists, follow the `INSTALL.md` step-by-step. Only improvise if no guide is available.
+
 ## 2. Skills Structure
 You must create a skill for each channel of access to specific information.
 

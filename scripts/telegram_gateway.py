@@ -244,7 +244,8 @@ def find_task_by_msg_id(user_id, msg_id):
     # Use regex with word boundaries to avoid matching 123 in 123456
     patterns = [
         re.compile(rf"message_id:\s*{msg_id}\b"),
-        re.compile(rf"last_ai_message_id:\s*{msg_id}\b")
+        re.compile(rf"last_ai_message_id:\s*{msg_id}\b"),
+        re.compile(rf"status_message_id:\s*{msg_id}\b")
     ]
     
     for folder in [paths["tasks"], paths["archive"]]:
@@ -678,6 +679,37 @@ async def handle_message(message: types.Message):
         target_msg_id = message.reply_to_message.message_id
         parent_path = find_task_by_msg_id(user_id, target_msg_id)
         if parent_path:
+            # Check if the target task is blocked/waiting for input
+            try:
+                with open(parent_path, 'r') as f:
+                    parent_content = f.read()
+                parent_parts = parent_content.split('---', 2)
+                if len(parent_parts) >= 3:
+                    parent_meta = yaml.safe_load(parent_parts[1]) or {}
+                    parent_status = parent_meta.get('status', '')
+                    has_pending_confirm = (
+                        "<confirm>" in parent_content and 
+                        "--- USER DECISION ---" not in parent_content.split("<confirm>")[-1]
+                    )
+                    
+                    if parent_status in ('needs_user_input', 'blocked') or has_pending_confirm:
+                        # Append user input to the blocked task and unblock it
+                        if has_pending_confirm:
+                            user_input_section = f"\n\n--- USER DECISION ---\n{message.text}\n"
+                        else:
+                            user_input_section = f"\n\n--- USER INPUT ---\n{message.text}\n"
+                        
+                        parent_meta['status'] = 'planning'
+                        new_content = f"--- \n{yaml.dump(parent_meta, allow_unicode=True)}--- {parent_parts[2]}{user_input_section}"
+                        with open(parent_path, 'w') as f:
+                            f.write(new_content)
+                        
+                        try: await message.react(reaction=[types.ReactionTypeEmoji(emoji="👍")])
+                        except: pass
+                        return  # Don't create a new task
+            except Exception as e:
+                print(f"Error checking parent task: {e}")
+            
             parent_task_id = os.path.basename(parent_path)
     
     # Always create a NEW task
